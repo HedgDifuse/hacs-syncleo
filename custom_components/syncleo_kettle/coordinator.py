@@ -38,6 +38,13 @@ from .protocol import (
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.setLevel(logging.DEBUG)
 
+# A reconnect normally finishes within a few seconds. If the in-progress flag is
+# still set after this long, the reconnect task hung, was cancelled, or the
+# shared executor pool starved -- treat the flag as stale and allow a new
+# attempt. Without this, a single stuck reconnect leaves the device
+# permanently "unavailable" until Home Assistant restarts.
+RECONNECT_STUCK_TIMEOUT = 90
+
 class PolarisDataUpdateCoordinator(DataUpdateCoordinator, IncomingMessageListener, ConnectionStatusListener):
     """Class to manage fetching Polaris data."""
     
@@ -86,11 +93,62 @@ class PolarisDataUpdateCoordinator(DataUpdateCoordinator, IncomingMessageListene
         self.device_basetype = None
         self.is_conditioner = False
         self._reconnect_in_progress = False
+        self._reconnect_started_at = 0.0
         self._last_device_update = 0
         self._last_service_info = None
         self._last_reconnect_time = 0
         self._setup_complete = False  # Добавляем флаг завершения настройки
         self._discovered_device_info = None  # Сохраняем информацию об обнаруженном устройстве
+
+    def _reconnect_guard_active(self) -> bool:
+        """Whether a reconnect is genuinely in progress.
+
+        Auto-clears a stuck flag: every reconnect driver (the 30s poll, the
+        RECONNECTING handler and the discovery handler) refuses to start while
+        this flag is set, so if a reconnect task ever fails to clear it (a hung
+        or cancelled executor job, a crashed task, or executor-pool starvation
+        when many devices reconnect at once) the device would stay forever
+        "unavailable" until a Home Assistant restart. Treat a flag held longer
+        than RECONNECT_STUCK_TIMEOUT as stale.
+        """
+        if not self._reconnect_in_progress:
+            return False
+        held = time.time() - self._reconnect_started_at
+        if held >= RECONNECT_STUCK_TIMEOUT:
+            _LOGGER.warning(
+                "Reconnect flag stuck for %ds, clearing it to allow a new attempt",
+                int(held),
+            )
+            self._reconnect_in_progress = False
+            return False
+        return True
+
+    def _begin_reconnect(self) -> None:
+        """Mark a reconnect as started (sets the flag and its timestamp)."""
+        self._reconnect_in_progress = True
+        self._reconnect_started_at = time.time()
+
+    async def _async_refresh_device_from_discovery(self) -> None:
+        """Update cached service info from the freshest discovery data.
+
+        Ensures a reconnect uses the device's current address and public key
+        rather than stale cached values (e.g. after the device rebooted with a
+        new key), which otherwise required a Home Assistant restart to recover.
+        Failures are non-fatal: we simply fall back to the cached info.
+        """
+        try:
+            from .discovery import SyncleoDiscovery
+
+            discovery = SyncleoDiscovery.get_instance()
+            devices = await self._hass.async_add_executor_job(discovery.get_devices)
+            for device in devices:
+                if device.get("mac") == self._mac:
+                    await self._hass.async_add_executor_job(
+                        self.kettle.refresh_discovered_info, device
+                    )
+                    break
+        except Exception as err:
+            _LOGGER.debug("Could not refresh device from discovery: %s", err)
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Update data via library."""
@@ -108,7 +166,7 @@ class PolarisDataUpdateCoordinator(DataUpdateCoordinator, IncomingMessageListene
                 # Попробуем переподключиться если устройство доступно
                 if self.kettle.device and self.kettle.device.si:
                     _LOGGER.info("Device is available but connection is dead, attempting reconnect")
-                    if not self._reconnect_in_progress:
+                    if not self._reconnect_guard_active():
                         # Запускаем переподключение асинхронно
                         self._hass.async_create_task(self._async_perform_reconnect())
                 return self.data
@@ -123,10 +181,10 @@ class PolarisDataUpdateCoordinator(DataUpdateCoordinator, IncomingMessageListene
 
     async def _async_perform_reconnect(self):
         """Perform reconnection asynchronously."""
-        if self._reconnect_in_progress:
+        if self._reconnect_guard_active():
             return
-            
-        self._reconnect_in_progress = True
+
+        self._begin_reconnect()
         try:
             _LOGGER.info("Performing reconnection from data update")
             
@@ -139,6 +197,8 @@ class PolarisDataUpdateCoordinator(DataUpdateCoordinator, IncomingMessageListene
             
             # Запускаем новое соединение только если device_info уже создан
             if self.device_info is not None:
+                # Refresh address/pubkey in case the device rebooted.
+                await self._async_refresh_device_from_discovery()
                 await self._hass.async_add_executor_job(
                     self.kettle.start_server_if_needed,
                     self,  # incoming_message_listener
@@ -358,9 +418,9 @@ class PolarisDataUpdateCoordinator(DataUpdateCoordinator, IncomingMessageListene
         self.data["connected"] = status == ConnectionStatus.CONNECTED
         
         # Только для RECONNECTING статуса и если нет активного переподключения
-        if status == ConnectionStatus.RECONNECTING and not self._reconnect_in_progress:
+        if status == ConnectionStatus.RECONNECTING and not self._reconnect_guard_active():
             _LOGGER.info("Connection status changed to RECONNECTING, initiating restart")
-            self._reconnect_in_progress = True
+            self._begin_reconnect()
             
             async def restart_connection():
                 try:
@@ -374,14 +434,17 @@ class PolarisDataUpdateCoordinator(DataUpdateCoordinator, IncomingMessageListene
                         await self.kettle.async_force_reconnect()
                     
                     await asyncio.sleep(1.0)
-                    
+
+                    # Refresh address/pubkey in case the device rebooted.
+                    await self._async_refresh_device_from_discovery()
+
                     # Запускаем новое соединение в executor
                     await self._hass.async_add_executor_job(
                         self.kettle.start_server_if_needed,
                         self,  # incoming_message_listener
                         self   # connection_status_listener
                     )
-                    
+
                     _LOGGER.info("Connection restart from RECONNECTING status completed")
                     
                 except Exception as err:
@@ -430,7 +493,7 @@ class PolarisDataUpdateCoordinator(DataUpdateCoordinator, IncomingMessageListene
             _LOGGER.debug("Skipping reconnect - too recent")
             return False
             
-        if self._reconnect_in_progress:
+        if self._reconnect_guard_active():
             _LOGGER.debug("Skipping reconnect - already in progress")
             return False
             
@@ -517,12 +580,12 @@ class PolarisDataUpdateCoordinator(DataUpdateCoordinator, IncomingMessageListene
         
         # Дополнительная защита от частых переподключений
         current_time = time.time()
-        if self._reconnect_in_progress or (current_time - self._last_device_update < 10):
+        if self._reconnect_guard_active() or (current_time - self._last_device_update < 10):
             _LOGGER.debug("Skipping device update - reconnect already in progress or too recent")
             return
-            
+
         self._last_device_update = current_time
-        self._reconnect_in_progress = True
+        self._begin_reconnect()
         
         async def restart_connection():
             try:
@@ -537,6 +600,8 @@ class PolarisDataUpdateCoordinator(DataUpdateCoordinator, IncomingMessageListene
                 
                 # Запускаем новое соединение только если device_info уже создан
                 if self.device_info is not None:
+                    # Refresh address/pubkey in case the device rebooted.
+                    await self._async_refresh_device_from_discovery()
                     await self._hass.async_add_executor_job(
                         self.kettle.start_server_if_needed,
                         self,  # incoming_message_listener

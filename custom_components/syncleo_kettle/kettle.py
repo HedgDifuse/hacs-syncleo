@@ -438,6 +438,57 @@ class Kettle(DeviceListener, ConnectionStatusListener):
                 return None
             return self.device.si
 
+    def refresh_discovered_info(self, device_info: dict) -> bool:
+        """Refresh the cached service info from a freshly discovered device dict.
+
+        A reconnect rebuilds the connection from ``self.device.si`` (address and
+        public key). If the device rebooted with a new X25519 key or a new IP,
+        the cached values are stale and the handshake can never succeed -- which
+        previously needed a full Home Assistant restart to clear. Updating the
+        cached info here lets a plain reconnect recover. Returns True on update.
+        """
+        if not self.device:
+            return False
+        if not device_info or not device_info.get('public_key'):
+            return False
+
+        try:
+            from zeroconf import ServiceInfo
+            import socket
+
+            addresses = []
+            for ip in device_info.get('addresses', []):
+                try:
+                    addresses.append(socket.inet_pton(socket.AF_INET, ip))
+                except OSError:
+                    continue
+            if not addresses:
+                return False
+
+            properties = {
+                b'public': device_info['public_key'].encode('utf-8'),
+                b'curve': device_info['curve'].encode('utf-8'),
+                b'protocol': device_info['protocol'].encode('utf-8'),
+                b'vendor': device_info['vendor'].encode('utf-8'),
+                b'basetype': device_info['basetype'].encode('utf-8'),
+                b'devtype': device_info['devtype'].encode('utf-8'),
+                b'firmware': device_info['firmware'].encode('utf-8'),
+            }
+
+            service_info = ServiceInfo(
+                type_="_syncleo._udp.local.",
+                name=device_info['name'],
+                addresses=addresses,
+                port=device_info['port'],
+                properties=properties,
+                server=device_info['name'].split('.')[0] + '.local.',
+            )
+            self.device.set_info(service_info)
+            return True
+        except Exception as exc:
+            self._logger.error(f"Failed to refresh discovered info: {exc}")
+            return False
+
     def start_server_if_needed(self,
                                incoming_message_listener=None,
                                connection_status_listener=None):
