@@ -13,7 +13,17 @@ from homeassistant.data_entry_flow import FlowResult
 
 from .coordinator import PolarisDataUpdateCoordinator
 from .discovery import SyncleoDiscovery
-from .const import DOMAIN, POLARIS_DEVICE 
+from .const import DOMAIN, POLARIS_DEVICE, POLARIS_CONDITIONER_BASETYPE
+
+
+def _device_model_name(devtype: str, basetype: str = "") -> str:
+    """Return a human-readable model name, handling conditioners and unknowns."""
+    if str(basetype) in POLARIS_CONDITIONER_BASETYPE:
+        return "Air Conditioner"
+    try:
+        return POLARIS_DEVICE[int(devtype)]['model']
+    except (KeyError, ValueError):
+        return f"Type {devtype}"
 
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.setLevel(logging.DEBUG)
@@ -60,12 +70,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain="syncleo_kettle"):
             # Формируем понятное описание устройства
             description = f"{device['devtype']}: {device['mac']}"
             if device['vendor'] != 'Unknown':
-                description += f" ({device['vendor']}"
-                if int(device['basetype']) in POLARIS_DEVICE:
-                    description += f" {POLARIS_DEVICE[int(device['basetype'])]['model']}"
-                else:
-                    description += f" Unknown"
-                description += ")"
+                description += f" ({device['vendor']} {_device_model_name(device['devtype'], device['basetype'])})"
 
 #            description = f"{device['devtype']}: {device['mac']}"
 #            if device['vendor'] != 'Unknown':
@@ -102,10 +107,15 @@ class ConfigFlow(config_entries.ConfigFlow, domain="syncleo_kettle"):
                 _LOGGER.exception("Unexpected exception during validation")
                 errors["base"] = "unknown"
             else:
-                # Check if we don't already have an entry with this MAC
-                await self.async_set_unique_id(user_input["mac"].replace(":", "").lower())
+                # Check if we don't already have an entry with this MAC.
+                # raise_on_progress=False so a manual add doesn't abort with
+                # "already_in_progress" when a background zeroconf discovery flow
+                # exists for the same device (creating the entry cancels it).
+                await self.async_set_unique_id(
+                    user_input["mac"].replace(":", "").lower(), raise_on_progress=False
+                )
                 self._abort_if_unique_id_configured()
-                
+
                 return self.async_create_entry(title=info["title"], data=user_input)
 
         # If no devices found, show manual input
@@ -182,11 +192,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain="syncleo_kettle"):
             devtype = str_properties.get('devtype', '00')
         
         # Создаем понятное имя устройства
-        try:
-            model = POLARIS_DEVICE[int(devtype)]['model']
-        except (KeyError, ValueError):
-            model = f"Type {devtype}"
-        
+        model = _device_model_name(devtype, basetype)
+
         device_name = f"{vendor} {model}"
         
         # Создаем контекст для отображения понятного имени
@@ -235,4 +242,5 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any], discovered_d
         _LOGGER.error("Validation failed: %s", err)
         raise ConnectionError(f"Cannot connect to device: {err}") from err
     
-    return {"title": f"{discovered_devices[mac]['vendor']} {POLARIS_DEVICE[int(devtype)]['model']} {mac}"}
+    basetype = discovered_devices[mac].get("basetype", "")
+    return {"title": f"{discovered_devices[mac]['vendor']} {_device_model_name(devtype, basetype)} {mac}"}

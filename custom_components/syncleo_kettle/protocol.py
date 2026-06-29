@@ -156,7 +156,7 @@ class Message:
         return _id
 
     @staticmethod
-    def from_encrypted(buf: bytes, inkey: bytes, outkey: bytes) -> Message:
+    def from_encrypted(buf: bytes, inkey: bytes, outkey: bytes, conditioner: bool = False) -> Message:
         _logger.debug(f'Message:from_encrypted: buf={buf.hex()}')
 
         assert len(buf) >= 4, 'invalid size'
@@ -213,6 +213,14 @@ class Message:
                 # `UnknownMessage` is a special class that holds a packed command that we don't recognize.
                 # It will be used anyway if we don't find a match, so skip it here
                 if _cl == UnknownMessage:
+                    continue
+
+                # Type 66 is overloaded: kettles use it for ColorNight, air
+                # conditioners use it for program_data. Pick the right one based
+                # on the device class of this connection.
+                if _cl is ProgramDataMessage and not conditioner:
+                    continue
+                if _cl is ColorNightMessage and conditioner:
                     continue
 
                 if _cl.TYPE == type:
@@ -721,6 +729,93 @@ class NightMessage(SimpleBooleanMessage):
     def _repr_fields(self) -> ReprDict:
         return {'night': self.value}
 
+
+# --- Air conditioner ("conditioner") commands ---
+# These were confirmed by decompiling the RusClimate/Hommyn Android app
+# (com.syncleoiot.app.api.commands.Cmd*; each Cmd* exposes a `CMD` byte that is
+# the UDP command type and a `TOPIC` string for the cloud-MQTT bridge).
+#
+# A conditioner reuses several universal commands as-is: Mode (type 1, but its
+# value is an HVAC mode rather than a kettle PowerType), TargetTemperature
+# (type 2) and CurrentTemperature (type 20).
+
+class FanSpeedMessage(CmdOutgoingMessage, CmdIncomingMessage):
+    """Air conditioner fan speed (CmdSpeed, type 15).
+
+    Single byte: 0=auto, 1=min, 2=low, 3=middle, 4=high, 5=max.
+    """
+    TYPE = 15
+
+    speed: int
+
+    def __init__(self, speed: int, seq: Optional[int] = None):
+        super().__init__(seq)
+        self.speed = speed
+
+    @classmethod
+    def from_packed_data(cls, data: bytes, seq=0) -> FanSpeedMessage:
+        assert len(data) >= 1, 'fan speed expects at least 1 byte'
+        return FanSpeedMessage(data[0], seq=seq)
+
+    def pack_data(self) -> bytes:
+        return bytes([self.speed & 0xff])
+
+    def _repr_fields(self) -> ReprDict:
+        return {'speed': self.speed}
+
+
+class ProgramDataMessage(CmdOutgoingMessage, CmdIncomingMessage):
+    """Air conditioner "program_data" command (CmdProgramData, type 66).
+
+    The payload is a raw byte array prefixed with a "mode" selector. For swing
+    control the app uses program 0 with the layout
+    ``[0, vertical(0/1), horizontal(0/1), ...]``.
+
+    NOTE: type 66 is also used by kettles for the ColorNight command. The
+    incoming decoder disambiguates the two using the connection's
+    ``conditioner`` flag (see :meth:`Message.from_encrypted`).
+    """
+    TYPE = 66
+
+    program_data: bytes
+
+    def __init__(self, data: Union[bytes, bytearray] = b'', seq: Optional[int] = None):
+        super().__init__(seq)
+        self.program_data = bytes(data)
+
+    @classmethod
+    def from_packed_data(cls, data: bytes, seq=0) -> ProgramDataMessage:
+        return ProgramDataMessage(data, seq=seq)
+
+    def pack_data(self) -> bytes:
+        return bytes(self.program_data)
+
+    def _repr_fields(self) -> ReprDict:
+        return {'program_data': self.program_data.hex()}
+
+
+class TurboMessage(SimpleBooleanMessage):
+    """Air conditioner turbo boost (CmdTurbo, type 49)."""
+    TYPE = 49
+
+    def pack_data(self) -> bytes:
+        return struct.pack('<B', 1 if self.value else 0)
+
+    def _repr_fields(self) -> ReprDict:
+        return {'turbo': self.value}
+
+
+class IonizationMessage(SimpleBooleanMessage):
+    """Air conditioner ioniser (CmdIonization, type 24)."""
+    TYPE = 24
+
+    def pack_data(self) -> bytes:
+        return struct.pack('<B', 1 if self.value else 0)
+
+    def _repr_fields(self) -> ReprDict:
+        return {'ionization': self.value}
+
+
 class UnknownMessage(CmdIncomingMessage):
     type: Optional[int]
     data: bytes
@@ -877,10 +972,15 @@ class UDPConnection(threading.Thread, ConnectionStatusListener):
                  port: int,
                  device_pubkey: bytes,
                  device_token: bytes,
-                 read_timeout: int = 1):
+                 read_timeout: int = 1,
+                 conditioner: bool = False):
         super().__init__()
         self._logger = logging.getLogger(f'{__name__}.{self.__class__.__name__} <{hex(id(self))}>')
         self.setName(self.__class__.__name__)
+
+        # Whether this connection talks to an air conditioner (affects how some
+        # overloaded command types are decoded).
+        self.conditioner = conditioner
 
         self.inseq = 0
         self.outseq = 0
@@ -1197,7 +1297,8 @@ class UDPConnection(threading.Thread, ConnectionStatusListener):
 
     def _handle_incoming(self, buf: bytes):
         try:
-            incoming_message = Message.from_encrypted(buf, inkey=self.encinkey, outkey=self.encoutkey)
+            incoming_message = Message.from_encrypted(buf, inkey=self.encinkey, outkey=self.encoutkey,
+                                                       conditioner=self.conditioner)
         except ValueError as exc:
             # handle "ValueError: Invalid padding bytes."
             self._logger.error('_handle_incoming: failed to decrypt incoming frame:')

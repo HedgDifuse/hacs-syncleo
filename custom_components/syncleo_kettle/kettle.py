@@ -18,6 +18,10 @@ from .protocol import (
     NightMessage,
     ColorNightMessage,
     TargetTemperatureMessage,
+    FanSpeedMessage,
+    ProgramDataMessage,
+    TurboMessage,
+    IonizationMessage,
     PowerType,
     ConnectionStatus,
     ConnectionStatusListener,
@@ -279,6 +283,9 @@ class Kettle(DeviceListener, ConnectionStatusListener):
         self.device_token = device_token
         self.conn = None
         self.conn_status = None
+        # Set by the coordinator once the device class is known. Air conditioners
+        # decode some overloaded command types differently (see protocol.py).
+        self.is_conditioner = False
         self._read_timeout = read_timeout
         self._find_evt = threading.Event()
         self._logger = logging.getLogger(f'{__name__}.{self.__class__.__name__}[{mac}]')  # Добавляем MAC в логгер
@@ -466,7 +473,9 @@ class Kettle(DeviceListener, ConnectionStatusListener):
             return
     
         assert self.device.curve == 29, f'curve type {self.device.curve} is not implemented'
-        assert self.device.protocol == 2, f'protocol {self.device.protocol} is not supported'
+        # Kettles use protocol 2, RusClimate/Hommyn air conditioners use protocol 3.
+        # Both share the same X25519 (curve 29) handshake and AES-CBC framing.
+        assert self.device.protocol in (2, 3), f'protocol {self.device.protocol} is not supported'
     
         kw = {}
         if self._read_timeout is not None:
@@ -476,7 +485,8 @@ class Kettle(DeviceListener, ConnectionStatusListener):
         self.conn = UDPConnection(addr=self.device.addr,
                                   port=self.device.port,
                                   device_pubkey=self.device.pubkey,
-                                  device_token=bytes.fromhex(self.device_token), **kw)
+                                  device_token=bytes.fromhex(self.device_token),
+                                  conditioner=self.is_conditioner, **kw)
         if incoming_message_listener:
             self.conn.add_incoming_message_listener(incoming_message_listener)
     
@@ -568,4 +578,58 @@ class Kettle(DeviceListener, ConnectionStatusListener):
             return
             
         message = ColorNightMessage(r, g, b, w, data_length)
+        self.conn.enqueue_message(WrappedMessage(message, handler=callback, ack=True))
+
+    # --- Air conditioner controls ---
+
+    def set_conditioner_mode(self, mode: int, callback: callable):
+        """Set the air conditioner operating mode (0=off,1=auto,2=cool,3=dry,4=heat,5=fan)."""
+        if self.conn is None:
+            self._logger.error("Cannot set conditioner mode: not connected")
+            callback(False)
+            return
+
+        # The conditioner reuses the universal Mode command (type 1); only the
+        # value semantics differ from the kettle PowerType.
+        message = ModeMessage(PowerType(mode))
+        self.conn.enqueue_message(WrappedMessage(message, handler=callback, ack=True))
+
+    def set_fan_speed(self, speed: int, callback: callable):
+        """Set the air conditioner fan speed (0=auto .. 5=max)."""
+        if self.conn is None:
+            self._logger.error("Cannot set fan speed: not connected")
+            callback(False)
+            return
+
+        message = FanSpeedMessage(speed)
+        self.conn.enqueue_message(WrappedMessage(message, handler=callback, ack=True))
+
+    def set_program_data(self, data: bytes, callback: callable):
+        """Send a raw program_data command (swing / silent / eco on conditioners)."""
+        if self.conn is None:
+            self._logger.error("Cannot set program data: not connected")
+            callback(False)
+            return
+
+        message = ProgramDataMessage(data)
+        self.conn.enqueue_message(WrappedMessage(message, handler=callback, ack=True))
+
+    def set_turbo(self, enabled: bool, callback: callable):
+        """Set the air conditioner turbo boost."""
+        if self.conn is None:
+            self._logger.error("Cannot set turbo: not connected")
+            callback(False)
+            return
+
+        message = TurboMessage(enabled)
+        self.conn.enqueue_message(WrappedMessage(message, handler=callback, ack=True))
+
+    def set_ionization(self, enabled: bool, callback: callable):
+        """Set the air conditioner ioniser."""
+        if self.conn is None:
+            self._logger.error("Cannot set ionization: not connected")
+            callback(False)
+            return
+
+        message = IonizationMessage(enabled)
         self.conn.enqueue_message(WrappedMessage(message, handler=callback, ack=True))

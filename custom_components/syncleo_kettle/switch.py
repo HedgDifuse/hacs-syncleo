@@ -22,6 +22,16 @@ async def async_setup_entry(
 ) -> None:
     """Set up Syncleo Kettle switch platform from config entry."""
     coordinator: PolarisDataUpdateCoordinator = hass.data[DOMAIN][config_entry.entry_id]
+
+    # Air conditioners expose their own set of toggles (the climate entity covers
+    # mode / temperature / fan / swing).
+    if coordinator.is_conditioner:
+        async_add_entities([
+            ConditionerSwitch(coordinator, config_entry.entry_id, key, name, data_key, setter, icon)
+            for key, name, data_key, setter, icon in CONDITIONER_SWITCHES
+        ])
+        return
+
     # Добавляем только тем чайникам, у которых есть подсветка
     if coordinator.device_info['model_id'] in POLARIS_KETTLE_WITH_BACKLIGHT_TYPE:
         switches = [
@@ -78,6 +88,56 @@ class ChildLockSwitch(SwitchEntity):
     def should_poll(self) -> bool:
         """No need to poll, coordinator notifies of updates."""
         return False
+
+
+# (key suffix, friendly name, coordinator.data key, coordinator setter, icon)
+# Turbo and Silent are exposed through the climate fan-mode selector instead.
+CONDITIONER_SWITCHES = [
+    ("eco", "Eco", "eco", "async_set_eco", "mdi:leaf"),
+    ("ionization", "Ionization", "ionization", "async_set_ionization", "mdi:atom-variant"),
+    ("display", "Display", "backlight", "async_set_display", "mdi:monitor"),
+]
+
+
+class ConditionerSwitch(SwitchEntity):
+    """A generic on/off toggle for an air conditioner feature."""
+
+    _attr_has_entity_name = True
+
+    def __init__(self, coordinator: PolarisDataUpdateCoordinator, entry_id: str,
+                 key: str, name: str, data_key: str, setter: str, icon: str) -> None:
+        self.coordinator = coordinator
+        self._entry_id = entry_id
+        self._data_key = data_key
+        self._setter = setter
+        self._attr_name = name
+        self._attr_icon = icon
+        self._attr_unique_id = f"{coordinator._mac}_{key}"
+        self._attr_device_info = coordinator.device_info
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator.data.get("connected", False)
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.data.get(self._data_key, False)
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        await getattr(self.coordinator, self._setter)(True)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await getattr(self.coordinator, self._setter)(False)
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(
+            self.coordinator.async_add_listener(self.async_write_ha_state)
+        )
+
+    @property
+    def should_poll(self) -> bool:
+        return False
+
 
 class VolumeSwitch(SwitchEntity):
     """Representation of a Volume switch."""

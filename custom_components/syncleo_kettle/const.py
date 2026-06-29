@@ -301,3 +301,41 @@ POLARIS_HUMIDDIFIER_5B_MODE_TYPE = ["72","74","87","147","155"]
 POLARIS_HUMIDDIFIER_4_MODE_TYPE = ["15","71","73","75","99"]
 POLARIS_HUMIDDIFIER_3A_MODE_TYPE = ["25"]
 POLARIS_HUMIDDIFIER_3B_MODE_TYPE = ["153","157","158"]
+
+# --- Air conditioner ("conditioner") support ---
+# RusClimate / Hommyn air conditioners advertise over the same
+# `_syncleo._udp.local` mDNS service as Polaris kettles, but identify themselves
+# with basetype "43" and protocol "3" (kettles use protocol "2").
+# We classify a device as a conditioner by its basetype rather than its devtype,
+# because the devtype namespace overlaps between Polaris and RusClimate.
+POLARIS_CONDITIONER_BASETYPE = ["43"]
+
+# Operating-mode values carried by the Mode command (type 1) on conditioners.
+# These intentionally differ from the kettle PowerType enum.
+CONDITIONER_MODE_OFF = 0
+CONDITIONER_MODE_AUTO = 1
+CONDITIONER_MODE_COOL = 2
+CONDITIONER_MODE_DRY = 3       # "defrosting"/dehumidify in the vendor app
+CONDITIONER_MODE_HEAT = 4
+CONDITIONER_MODE_FAN = 5       # fan only
+
+# Fan-speed values carried by the Speed command (type 15). Confirmed live on a
+# RusClimate AC: only these four values exist. "silent" and "turbo" shown in the
+# vendor app are NOT fan speeds -- silent is a program_data toggle and turbo is a
+# separate command (type 49).
+# Use Home Assistant's standard fan-mode names so the frontend shows the proper
+# icons (it only has built-in icons for auto/low/medium/high/...).
+CONDITIONER_FAN_MODES = {
+    "auto": 0,
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+}
+
+# Swing is encoded as the first two bytes of the program_data byte array:
+#   byte0 = vertical (up/down) swing, byte1 = horizontal (left/right) swing.
+CONDITIONER_SWING_MODES = ["off", "vertical", "horizontal", "both"]
+
+CONDITIONER_MIN_TEMP = 16
+CONDITIONER_MAX_TEMP = 30
+CONDITIONER_TEMP_STEP = 1

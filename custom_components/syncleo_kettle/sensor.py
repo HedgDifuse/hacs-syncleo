@@ -33,6 +33,10 @@ async def async_setup_entry(
     if coordinator.device_info is None:
         _LOGGER.error("Device info not available, cannot create entity")
         return
+    # These sensors are kettle-specific; the air conditioner exposes its
+    # temperature through the climate entity.
+    if coordinator.is_conditioner:
+        return
     # Добавляем только чайники с весом
     if coordinator.device_info['model_id'] in POLARIS_KETTLE_WITH_WEIGHT_TYPE:
         sensors = [

@@ -11,7 +11,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import DOMAIN, POLARIS_DEVICE
+from .const import DOMAIN, POLARIS_DEVICE, POLARIS_CONDITIONER_BASETYPE
 from .kettle import Kettle
 from .protocol import (
     PowerType,
@@ -28,7 +28,11 @@ from .protocol import (
     ColorNightMessage,
     DeviceHardwareMessage,
     ErrorMessage,
-    WeightMessage
+    WeightMessage,
+    FanSpeedMessage,
+    ProgramDataMessage,
+    TurboMessage,
+    IonizationMessage,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -65,10 +69,22 @@ class PolarisDataUpdateCoordinator(DataUpdateCoordinator, IncomingMessageListene
             "connected": False,
             "device_hardware": None,
             "weight": None,
+            # Air-conditioner state
+            "conditioner_mode": 0,   # 0=off, 1=auto, 2=cool, 3=dry, 4=heat, 5=fan
+            "fan_speed": 0,          # 0=auto, 1=low, 2=mid, 3=high
+            "swing_mode": "off",     # off/vertical/horizontal/both
+            "program0": [0, 0, 0, 0, 0],  # last program-0 array [prefix, vert, horiz, eco, ?]
+            "turbo": False,
+            "silent": False,
+            "eco": False,
+            "ionization": False,
         }
-        
+
         # Device info будет установлен после discovery
         self.device_info = None
+        # Set once we know the device's basetype (see _create_device_info*).
+        self.device_basetype = None
+        self.is_conditioner = False
         self._reconnect_in_progress = False
         self._last_device_update = 0
         self._last_service_info = None
@@ -166,15 +182,23 @@ class PolarisDataUpdateCoordinator(DataUpdateCoordinator, IncomingMessageListene
             devtype = self._discovered_device_info.get('devtype', '00')
             firmware = self._discovered_device_info.get('firmware', '0.00')
         
+        # Track device class so platforms can decide what entities to create.
+        self.device_basetype = str(basetype)
+        self.is_conditioner = self.device_basetype in POLARIS_CONDITIONER_BASETYPE
+        self.kettle.is_conditioner = self.is_conditioner
+
         # Получаем модель из POLARIS_DEVICE или используем базовый тип
-        try:
-            model = POLARIS_DEVICE[int(devtype)]['model']
-        except (KeyError, ValueError):
-            model = f"Type {devtype}"
-            _LOGGER.warning("Unknown device type: %s, using default model", devtype)
-        
+        if self.is_conditioner:
+            model = "Air Conditioner"
+        else:
+            try:
+                model = POLARIS_DEVICE[int(devtype)]['model']
+            except (KeyError, ValueError):
+                model = f"Type {devtype}"
+                _LOGGER.warning("Unknown device type: %s, using default model", devtype)
+
         _LOGGER.info(f"Device info: vendor={vendor}, basetype={basetype}, devtype={devtype}, firmware={firmware}, model={model}")
-        
+
         self.device_info = DeviceInfo(
             identifiers={(DOMAIN, self._mac)},
             name=f"{vendor} {model} {self._mac}",
@@ -197,6 +221,11 @@ class PolarisDataUpdateCoordinator(DataUpdateCoordinator, IncomingMessageListene
     @callback
     def _async_handle_incoming_message(self, message) -> None:
         """Handle incoming messages in event loop."""
+        if self.is_conditioner:
+            self._handle_conditioner_message(message)
+            self.async_set_updated_data(self.data)
+            return
+
         if isinstance(message, CurrentTemperatureMessage):
             self.data["current_temperature"] = message.current_temperature
             # Determine if heating based on temperature and power state
@@ -251,9 +280,68 @@ class PolarisDataUpdateCoordinator(DataUpdateCoordinator, IncomingMessageListene
             
         elif isinstance(message, ErrorMessage):
             self.data["error"] = message.value
-        
+
         # Schedule update for entities
         self.async_set_updated_data(self.data)
+
+    def _handle_conditioner_message(self, message) -> None:
+        """Update air-conditioner state from an incoming message."""
+        if isinstance(message, ModeMessage):
+            # For conditioners the Mode value is an HVAC mode, not a PowerType.
+            self.data["conditioner_mode"] = message.pt.value
+
+        elif isinstance(message, TargetTemperatureMessage):
+            self.data["target_temperature"] = message.temperature
+
+        elif isinstance(message, CurrentTemperatureMessage):
+            self.data["current_temperature"] = message.current_temperature
+
+        elif isinstance(message, FanSpeedMessage):
+            self.data["fan_speed"] = message.speed
+
+        elif isinstance(message, TurboMessage):
+            self.data["turbo"] = message.value
+
+        elif isinstance(message, IonizationMessage):
+            self.data["ionization"] = message.value
+
+        elif isinstance(message, BacklightMessage):
+            self.data["backlight"] = message.value
+
+        elif isinstance(message, ProgramDataMessage):
+            self._handle_program_data(message.program_data)
+
+        elif isinstance(message, ErrorMessage):
+            self.data["error"] = message.value
+
+    def _handle_program_data(self, data: bytes) -> None:
+        """Decode a program_data payload into swing / eco / silent state.
+
+        The first byte selects the program:
+          * program 0: [0, vertical, horizontal, eco, ...]
+          * program 1: [1, 0, silent]
+        """
+        if not data:
+            return
+
+        if data[0] == 0:
+            self.data["program0"] = list(data)
+            vertical = len(data) > 1 and data[1] != 0
+            horizontal = len(data) > 2 and data[2] != 0
+            if vertical and horizontal:
+                self.data["swing_mode"] = "both"
+            elif vertical:
+                self.data["swing_mode"] = "vertical"
+            elif horizontal:
+                self.data["swing_mode"] = "horizontal"
+            else:
+                self.data["swing_mode"] = "off"
+            if len(data) > 3:
+                self.data["eco"] = data[3] != 0
+
+        elif data[0] == 1:
+            # Silent program: value is the last byte.
+            self.data["silent"] = data[-1] != 0
 
     def connection_status_updated(self, status: ConnectionStatus) -> None:
         """Handle connection status updates."""
@@ -394,14 +482,22 @@ class PolarisDataUpdateCoordinator(DataUpdateCoordinator, IncomingMessageListene
         
         # Сохраняем информацию об устройстве для будущего использования
         self._discovered_device_info = device_info
-        
+
+        # Track device class so platforms can decide what entities to create.
+        self.device_basetype = str(basetype)
+        self.is_conditioner = self.device_basetype in POLARIS_CONDITIONER_BASETYPE
+        self.kettle.is_conditioner = self.is_conditioner
+
         # Получаем модель из POLARIS_DEVICE или используем базовый тип
-        try:
-            model = POLARIS_DEVICE[int(devtype)]['model']
-        except (KeyError, ValueError):
-            model = f"Type {devtype}"
-            _LOGGER.warning("Unknown device type: %s, using default model", devtype)
-        
+        if self.is_conditioner:
+            model = "Air Conditioner"
+        else:
+            try:
+                model = POLARIS_DEVICE[int(devtype)]['model']
+            except (KeyError, ValueError):
+                model = f"Type {devtype}"
+                _LOGGER.warning("Unknown device type: %s, using default model", devtype)
+
         _LOGGER.info(f"Device info from dict: vendor={vendor}, basetype={basetype}, devtype={devtype}, firmware={firmware}, model={model}")
         
         self.device_info = DeviceInfo(
@@ -585,7 +681,123 @@ class PolarisDataUpdateCoordinator(DataUpdateCoordinator, IncomingMessageListene
     async def async_set_color_night(self, r: int, g: int, b: int, w: int = 0, data_length: int = 4) -> None:
         """Set color night state with variable data length."""
         def set_color_night():
-            self.kettle.set_color_night(r, g, b, w, data_length, 
+            self.kettle.set_color_night(r, g, b, w, data_length,
                                        lambda x: _LOGGER.debug(f"Color night set callback: {x}"))
-        
+
         await self._hass.async_add_executor_job(set_color_night)
+
+    # --- Air conditioner controls ---
+
+    async def async_set_conditioner_mode(self, mode: int) -> None:
+        """Set the air conditioner operating mode."""
+        # Optimistically reflect the new mode so the UI responds immediately.
+        self.data["conditioner_mode"] = mode
+        self.async_set_updated_data(self.data)
+
+        def set_mode():
+            self.kettle.set_conditioner_mode(
+                mode, lambda x: _LOGGER.debug("Conditioner mode set callback: %s", x)
+            )
+
+        await self._hass.async_add_executor_job(set_mode)
+
+    async def async_set_fan_speed(self, speed: int) -> None:
+        """Set the air conditioner fan speed."""
+        self.data["fan_speed"] = speed
+        self.async_set_updated_data(self.data)
+
+        def set_fan_speed():
+            self.kettle.set_fan_speed(
+                speed, lambda x: _LOGGER.debug("Fan speed set callback: %s", x)
+            )
+
+        await self._hass.async_add_executor_job(set_fan_speed)
+
+    def _program0(self) -> list[int]:
+        """Return a mutable copy of the last program-0 array (length >= 5)."""
+        p0 = list(self.data.get("program0") or [])
+        if not p0 or p0[0] != 0:
+            p0 = [0, 0, 0, 0, 0]
+        while len(p0) < 5:
+            p0.append(0)
+        p0[0] = 0
+        return p0
+
+    async def _send_program0(self, p0: list[int]) -> None:
+        self.data["program0"] = list(p0)
+        self.async_set_updated_data(self.data)
+        payload = bytes(p0)
+
+        def send():
+            self.kettle.set_program_data(
+                payload, lambda x: _LOGGER.debug("program_data set callback: %s", x)
+            )
+
+        await self._hass.async_add_executor_job(send)
+
+    async def async_set_swing(self, vertical: bool, horizontal: bool) -> None:
+        """Set the air conditioner swing mode via program 0."""
+        p0 = self._program0()
+        p0[1] = 1 if vertical else 0
+        p0[2] = 1 if horizontal else 0
+
+        if vertical and horizontal:
+            self.data["swing_mode"] = "both"
+        elif vertical:
+            self.data["swing_mode"] = "vertical"
+        elif horizontal:
+            self.data["swing_mode"] = "horizontal"
+        else:
+            self.data["swing_mode"] = "off"
+
+        await self._send_program0(p0)
+
+    async def async_set_eco(self, enabled: bool) -> None:
+        """Set the air conditioner eco mode (program 0, byte 3)."""
+        p0 = self._program0()
+        p0[3] = 1 if enabled else 0
+        self.data["eco"] = enabled
+        await self._send_program0(p0)
+
+    async def async_set_silent(self, enabled: bool) -> None:
+        """Set the air conditioner silent mode (program 1)."""
+        self.data["silent"] = enabled
+        self.async_set_updated_data(self.data)
+        payload = bytes([1, 0, 1 if enabled else 0])
+
+        def send():
+            self.kettle.set_program_data(
+                payload, lambda x: _LOGGER.debug("Silent set callback: %s", x)
+            )
+
+        await self._hass.async_add_executor_job(send)
+
+    async def async_set_turbo(self, enabled: bool) -> None:
+        """Set the air conditioner turbo boost."""
+        self.data["turbo"] = enabled
+        self.async_set_updated_data(self.data)
+
+        def set_turbo():
+            self.kettle.set_turbo(enabled, lambda x: _LOGGER.debug("Turbo set callback: %s", x))
+
+        await self._hass.async_add_executor_job(set_turbo)
+
+    async def async_set_ionization(self, enabled: bool) -> None:
+        """Set the air conditioner ioniser."""
+        self.data["ionization"] = enabled
+        self.async_set_updated_data(self.data)
+
+        def set_ionization():
+            self.kettle.set_ionization(enabled, lambda x: _LOGGER.debug("Ionization set callback: %s", x))
+
+        await self._hass.async_add_executor_job(set_ionization)
+
+    async def async_set_display(self, enabled: bool) -> None:
+        """Set the air conditioner display/backlight."""
+        self.data["backlight"] = enabled
+        self.async_set_updated_data(self.data)
+
+        def set_display():
+            self.kettle.set_backlight(enabled, lambda x: _LOGGER.debug("Display set callback: %s", x))
+
+        await self._hass.async_add_executor_job(set_display)
