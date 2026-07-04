@@ -27,8 +27,8 @@ async def async_setup_entry(
     # mode / temperature / fan / swing).
     if coordinator.is_conditioner:
         async_add_entities([
-            ConditionerSwitch(coordinator, config_entry.entry_id, key, name, data_key, setter, icon)
-            for key, name, data_key, setter, icon in CONDITIONER_SWITCHES
+            ConditionerSwitch(coordinator, config_entry.entry_id, key, data_key, setter, icon)
+            for key, data_key, setter, icon in CONDITIONER_SWITCHES
         ])
         return
 
@@ -90,12 +90,14 @@ class ChildLockSwitch(SwitchEntity):
         return False
 
 
-# (key suffix, friendly name, coordinator.data key, coordinator setter, icon)
+# (key suffix / translation key, coordinator.data key, coordinator setter, icon)
 # Turbo and Silent are exposed through the climate fan-mode selector instead.
 CONDITIONER_SWITCHES = [
-    ("eco", "Eco", "eco", "async_set_eco", "mdi:leaf"),
-    ("ionization", "Ionization", "ionization", "async_set_ionization", "mdi:atom-variant"),
-    ("display", "Display", "backlight", "async_set_display", "mdi:monitor"),
+    ("eco", "eco", "async_set_eco", "mdi:leaf"),
+    ("ionization", "ionization", "async_set_ionization", "mdi:atom-variant"),
+    ("display", "backlight", "async_set_display", "mdi:monitor"),
+    ("fungus_prevention", "fungus_prevention", "async_set_fungus_prevention", "mdi:mushroom-off"),
+    ("self_clean", "self_clean", "async_set_self_clean", "mdi:shimmer"),
 ]
 
 
@@ -105,12 +107,12 @@ class ConditionerSwitch(SwitchEntity):
     _attr_has_entity_name = True
 
     def __init__(self, coordinator: PolarisDataUpdateCoordinator, entry_id: str,
-                 key: str, name: str, data_key: str, setter: str, icon: str) -> None:
+                 key: str, data_key: str, setter: str, icon: str) -> None:
         self.coordinator = coordinator
         self._entry_id = entry_id
         self._data_key = data_key
         self._setter = setter
-        self._attr_name = name
+        self._attr_translation_key = key
         self._attr_icon = icon
         self._attr_unique_id = f"{coordinator._mac}_{key}"
         self._attr_device_info = coordinator.device_info

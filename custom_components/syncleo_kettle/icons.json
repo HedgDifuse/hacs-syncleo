@@ -1,5 +1,17 @@
 {
   "entity": {
+    "climate": {
+      "conditioner": {
+        "state_attributes": {
+          "fan_mode": {
+            "state": {
+              "silent": "mdi:volume-mute",
+              "turbo": "mdi:rocket-launch"
+            }
+          }
+        }
+      }
+    },
     "water_heater": {
       "syncleo_kettle": {
         "default": "mdi:kettle",

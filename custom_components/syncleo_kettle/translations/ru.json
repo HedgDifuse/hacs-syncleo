@@ -21,6 +21,22 @@
     }
   },
   "entity": {
+    "climate": {
+      "conditioner": {
+        "state_attributes": {
+          "fan_mode": {
+            "state": {
+              "silent": "Тихий",
+              "auto": "Автоматический",
+              "low": "Низкий",
+              "medium": "Средний",
+              "high": "Высокий",
+              "turbo": "Турбо"
+            }
+          }
+        }
+      }
+    },
     "switch": {
       "child_lock": {
         "name": "Блокировка от детей"
@@ -30,6 +46,32 @@
       },
       "backlight": {
         "name": "Подсветка"
+      },
+      "eco": {
+        "name": "Эко-режим"
+      },
+      "ionization": {
+        "name": "Ионизация"
+      },
+      "display": {
+        "name": "Дисплей"
+      },
+      "fungus_prevention": {
+        "name": "Защита от грибка"
+      },
+      "self_clean": {
+        "name": "Самоочистка"
+      }
+    },
+    "sensor": {
+      "current_temperature": {
+        "name": "Текущая температура"
+      },
+      "weight": {
+        "name": "Вес"
+      },
+      "device_hardware": {
+        "name": "Аппаратная версия"
       }
     },
     "water_heater": {

@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import time
 from datetime import timedelta
 from typing import Any
 
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -45,6 +47,12 @@ _LOGGER.setLevel(logging.DEBUG)
 # permanently "unavailable" until Home Assistant restarts.
 RECONNECT_STUCK_TIMEOUT = 90
 
+# How long to wait for the device to ACK an outgoing command. The protocol
+# layer resends a frame up to RESEND_ATTEMPTS times and gives up (calling the
+# handler with False) after MESSAGE_QUEUE_REMOVE_DELAY = 13s, so this only
+# needs a small margin on top of that.
+COMMAND_ACK_TIMEOUT = 15
+
 class PolarisDataUpdateCoordinator(DataUpdateCoordinator, IncomingMessageListener, ConnectionStatusListener):
     """Class to manage fetching Polaris data."""
     
@@ -80,11 +88,13 @@ class PolarisDataUpdateCoordinator(DataUpdateCoordinator, IncomingMessageListene
             "conditioner_mode": 0,   # 0=off, 1=auto, 2=cool, 3=dry, 4=heat, 5=fan
             "fan_speed": 0,          # 0=auto, 1=low, 2=mid, 3=high
             "swing_mode": "off",     # off/vertical/horizontal/both
-            "program0": [0, 0, 0, 0, 0],  # last program-0 array [prefix, vert, horiz, eco, ?]
+            "program0": [0, 0, 0, 0, 0],  # last program-0 array [prefix, vert, horiz, eco, fungus]
             "turbo": False,
             "silent": False,
             "eco": False,
             "ionization": False,
+            "fungus_prevention": False,
+            "self_clean": False,
         }
 
         # Device info будет установлен после discovery
@@ -375,11 +385,11 @@ class PolarisDataUpdateCoordinator(DataUpdateCoordinator, IncomingMessageListene
             self.data["error"] = message.value
 
     def _handle_program_data(self, data: bytes) -> None:
-        """Decode a program_data payload into swing / eco / silent state.
+        """Decode a program_data payload into feature state.
 
         The first byte selects the program:
-          * program 0: [0, vertical, horizontal, eco, ...]
-          * program 1: [1, 0, silent]
+          * program 0: [0, vertical, horizontal, eco, fungus_prevention]
+          * program 1: [1, self_clean, silent]
         """
         if not data:
             return
@@ -398,10 +408,14 @@ class PolarisDataUpdateCoordinator(DataUpdateCoordinator, IncomingMessageListene
                 self.data["swing_mode"] = "off"
             if len(data) > 3:
                 self.data["eco"] = data[3] != 0
+            if len(data) > 4:
+                self.data["fungus_prevention"] = data[4] != 0
 
         elif data[0] == 1:
-            # Silent program: value is the last byte.
-            self.data["silent"] = data[-1] != 0
+            if len(data) > 1:
+                self.data["self_clean"] = data[1] != 0
+            if len(data) > 2:
+                self.data["silent"] = data[2] != 0
 
     def connection_status_updated(self, status: ConnectionStatus) -> None:
         """Handle connection status updates."""
@@ -690,19 +704,60 @@ class PolarisDataUpdateCoordinator(DataUpdateCoordinator, IncomingMessageListene
             await self.shutdown()
             raise UpdateFailed(f"Setup failed: {err}") from err
 
+    async def _async_send_command(
+        self,
+        name: str,
+        setter: callable,
+        *args: Any,
+        revert: dict[str, Any] | None = None,
+    ) -> None:
+        """Send a command and validate that the device confirmed it.
+
+        The protocol layer resends the frame up to RESEND_ATTEMPTS times and
+        reports False to the callback if the device never ACKs it (or the
+        connection is down). On failure, restore the optimistic `revert`
+        snapshot (if any) and raise HomeAssistantError so the service call
+        fails visibly instead of silently showing a state the device never
+        reached.
+        """
+        future: asyncio.Future = self._hass.loop.create_future()
+
+        def command_callback(result: Any) -> None:
+            # Called from the UDP/executor thread; hop back to the event loop.
+            def resolve() -> None:
+                if not future.done():
+                    future.set_result(result)
+
+            self._hass.loop.call_soon_threadsafe(resolve)
+
+        await self._hass.async_add_executor_job(
+            functools.partial(setter, *args, command_callback)
+        )
+
+        try:
+            result = await asyncio.wait_for(future, timeout=COMMAND_ACK_TIMEOUT)
+        except asyncio.TimeoutError:
+            result = False
+
+        if result is False:
+            if revert is not None:
+                self.data.update(revert)
+                self.async_set_updated_data(self.data)
+            raise HomeAssistantError(
+                f"Device {self._mac} did not confirm the {name} command"
+            )
+
+        _LOGGER.debug("%s command confirmed by device: %s", name, result)
+
     async def async_set_power(self, power_type: PowerType) -> None:
         """Set kettle power state."""
-        def set_power():
-            self.kettle.set_power(power_type, lambda x: _LOGGER.debug("Power set callback: %s", x))
-        
-        await self._hass.async_add_executor_job(set_power)
+        await self._async_send_command("power", self.kettle.set_power, power_type)
 
     async def async_set_temperature(self, temperature: int) -> None:
         """Set target temperature."""
-        def set_temperature():
-            self.kettle.set_target_temperature(temperature, lambda x: _LOGGER.debug("Temperature set callback: %s", x))
-        
-        await self._hass.async_add_executor_job(set_temperature)
+        await self._async_send_command(
+            "target temperature", self.kettle.set_target_temperature, temperature
+        )
 
     async def shutdown(self) -> None:
         """Shutdown the kettle connection."""
@@ -714,69 +769,49 @@ class PolarisDataUpdateCoordinator(DataUpdateCoordinator, IncomingMessageListene
 
     async def async_set_child_lock(self, enabled: bool) -> None:
         """Set child lock state."""
-        def set_child_lock():
-#            message = ChildLockMessage(enabled)
-            self.kettle.set_child_lock(enabled, lambda x: _LOGGER.debug(f"Child lock set callback: {x}"))
-        
-        await self._hass.async_add_executor_job(set_child_lock)
+        await self._async_send_command("child lock", self.kettle.set_child_lock, enabled)
 
     async def async_set_volume(self, enabled: bool) -> None:
         """Set volume state."""
-        def set_volume():
-#            message = VolumeMessage(enabled)
-            self.kettle.set_volume(enabled, lambda x: _LOGGER.debug(f"Volume set callback: {x}"))
-        
-        await self._hass.async_add_executor_job(set_volume)
+        await self._async_send_command("volume", self.kettle.set_volume, enabled)
 
     async def async_set_backlight(self, enabled: bool) -> None:
         """Set backlight state."""
-        def set_backlight():
-#            message = BacklightMessage(enabled)
-            self.kettle.set_backlight(enabled, lambda x: _LOGGER.debug(f"Backlight set callback: {x}"))
-        
-        await self._hass.async_add_executor_job(set_backlight)
-        
+        await self._async_send_command("backlight", self.kettle.set_backlight, enabled)
+
     async def async_set_night(self, enabled: bool) -> None:
         """Set night state."""
-        def set_night():
-            self.kettle.set_night(enabled, lambda x: _LOGGER.debug(f"Night set callback: {x}"))
-        
-        await self._hass.async_add_executor_job(set_night)
+        await self._async_send_command("night", self.kettle.set_night, enabled)
 
     async def async_set_color_night(self, r: int, g: int, b: int, w: int = 0, data_length: int = 4) -> None:
         """Set color night state with variable data length."""
-        def set_color_night():
-            self.kettle.set_color_night(r, g, b, w, data_length,
-                                       lambda x: _LOGGER.debug(f"Color night set callback: {x}"))
-
-        await self._hass.async_add_executor_job(set_color_night)
+        await self._async_send_command(
+            "color night", self.kettle.set_color_night, r, g, b, w, data_length
+        )
 
     # --- Air conditioner controls ---
 
     async def async_set_conditioner_mode(self, mode: int) -> None:
         """Set the air conditioner operating mode."""
-        # Optimistically reflect the new mode so the UI responds immediately.
+        # Optimistically reflect the new mode so the UI responds immediately;
+        # _async_send_command reverts it if the device never confirms.
+        revert = {"conditioner_mode": self.data["conditioner_mode"]}
         self.data["conditioner_mode"] = mode
         self.async_set_updated_data(self.data)
 
-        def set_mode():
-            self.kettle.set_conditioner_mode(
-                mode, lambda x: _LOGGER.debug("Conditioner mode set callback: %s", x)
-            )
-
-        await self._hass.async_add_executor_job(set_mode)
+        await self._async_send_command(
+            "conditioner mode", self.kettle.set_conditioner_mode, mode, revert=revert
+        )
 
     async def async_set_fan_speed(self, speed: int) -> None:
         """Set the air conditioner fan speed."""
+        revert = {"fan_speed": self.data["fan_speed"]}
         self.data["fan_speed"] = speed
         self.async_set_updated_data(self.data)
 
-        def set_fan_speed():
-            self.kettle.set_fan_speed(
-                speed, lambda x: _LOGGER.debug("Fan speed set callback: %s", x)
-            )
-
-        await self._hass.async_add_executor_job(set_fan_speed)
+        await self._async_send_command(
+            "fan speed", self.kettle.set_fan_speed, speed, revert=revert
+        )
 
     def _program0(self) -> list[int]:
         """Return a mutable copy of the last program-0 array (length >= 5)."""
@@ -788,20 +823,20 @@ class PolarisDataUpdateCoordinator(DataUpdateCoordinator, IncomingMessageListene
         p0[0] = 0
         return p0
 
-    async def _send_program0(self, p0: list[int]) -> None:
+    async def _send_program0(self, p0: list[int], revert: dict[str, Any]) -> None:
         self.data["program0"] = list(p0)
         self.async_set_updated_data(self.data)
-        payload = bytes(p0)
 
-        def send():
-            self.kettle.set_program_data(
-                payload, lambda x: _LOGGER.debug("program_data set callback: %s", x)
-            )
-
-        await self._hass.async_add_executor_job(send)
+        await self._async_send_command(
+            "program data", self.kettle.set_program_data, bytes(p0), revert=revert
+        )
 
     async def async_set_swing(self, vertical: bool, horizontal: bool) -> None:
         """Set the air conditioner swing mode via program 0."""
+        revert = {
+            "program0": list(self.data["program0"]),
+            "swing_mode": self.data["swing_mode"],
+        }
         p0 = self._program0()
         p0[1] = 1 if vertical else 0
         p0[2] = 1 if horizontal else 0
@@ -815,54 +850,84 @@ class PolarisDataUpdateCoordinator(DataUpdateCoordinator, IncomingMessageListene
         else:
             self.data["swing_mode"] = "off"
 
-        await self._send_program0(p0)
+        await self._send_program0(p0, revert)
 
     async def async_set_eco(self, enabled: bool) -> None:
         """Set the air conditioner eco mode (program 0, byte 3)."""
+        revert = {
+            "program0": list(self.data["program0"]),
+            "eco": self.data["eco"],
+        }
         p0 = self._program0()
         p0[3] = 1 if enabled else 0
         self.data["eco"] = enabled
-        await self._send_program0(p0)
+        await self._send_program0(p0, revert)
+
+    def _program1(self) -> bytes:
+        """Build the program-1 payload [1, self_clean, silent] from current state."""
+        return bytes([
+            1,
+            1 if self.data["self_clean"] else 0,
+            1 if self.data["silent"] else 0,
+        ])
 
     async def async_set_silent(self, enabled: bool) -> None:
-        """Set the air conditioner silent mode (program 1)."""
+        """Set the air conditioner silent mode (program 1, byte 2)."""
+        revert = {"silent": self.data["silent"]}
         self.data["silent"] = enabled
         self.async_set_updated_data(self.data)
-        payload = bytes([1, 0, 1 if enabled else 0])
 
-        def send():
-            self.kettle.set_program_data(
-                payload, lambda x: _LOGGER.debug("Silent set callback: %s", x)
-            )
+        await self._async_send_command(
+            "silent", self.kettle.set_program_data, self._program1(), revert=revert
+        )
 
-        await self._hass.async_add_executor_job(send)
+    async def async_set_self_clean(self, enabled: bool) -> None:
+        """Set the air conditioner self-cleaning mode (program 1, byte 1)."""
+        revert = {"self_clean": self.data["self_clean"]}
+        self.data["self_clean"] = enabled
+        self.async_set_updated_data(self.data)
+
+        await self._async_send_command(
+            "self clean", self.kettle.set_program_data, self._program1(), revert=revert
+        )
+
+    async def async_set_fungus_prevention(self, enabled: bool) -> None:
+        """Set the air conditioner fungus-prevention mode (program 0, byte 4)."""
+        revert = {
+            "program0": list(self.data["program0"]),
+            "fungus_prevention": self.data["fungus_prevention"],
+        }
+        p0 = self._program0()
+        p0[4] = 1 if enabled else 0
+        self.data["fungus_prevention"] = enabled
+        await self._send_program0(p0, revert)
 
     async def async_set_turbo(self, enabled: bool) -> None:
         """Set the air conditioner turbo boost."""
+        revert = {"turbo": self.data["turbo"]}
         self.data["turbo"] = enabled
         self.async_set_updated_data(self.data)
 
-        def set_turbo():
-            self.kettle.set_turbo(enabled, lambda x: _LOGGER.debug("Turbo set callback: %s", x))
-
-        await self._hass.async_add_executor_job(set_turbo)
+        await self._async_send_command(
+            "turbo", self.kettle.set_turbo, enabled, revert=revert
+        )
 
     async def async_set_ionization(self, enabled: bool) -> None:
         """Set the air conditioner ioniser."""
+        revert = {"ionization": self.data["ionization"]}
         self.data["ionization"] = enabled
         self.async_set_updated_data(self.data)
 
-        def set_ionization():
-            self.kettle.set_ionization(enabled, lambda x: _LOGGER.debug("Ionization set callback: %s", x))
-
-        await self._hass.async_add_executor_job(set_ionization)
+        await self._async_send_command(
+            "ionization", self.kettle.set_ionization, enabled, revert=revert
+        )
 
     async def async_set_display(self, enabled: bool) -> None:
         """Set the air conditioner display/backlight."""
+        revert = {"backlight": self.data["backlight"]}
         self.data["backlight"] = enabled
         self.async_set_updated_data(self.data)
 
-        def set_display():
-            self.kettle.set_backlight(enabled, lambda x: _LOGGER.debug("Display set callback: %s", x))
-
-        await self._hass.async_add_executor_job(set_display)
+        await self._async_send_command(
+            "display", self.kettle.set_backlight, enabled, revert=revert
+        )

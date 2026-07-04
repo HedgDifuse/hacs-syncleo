@@ -57,7 +57,7 @@ class WeightSensor(SensorEntity):
     """Representation of a Weight sensor."""
     
     _attr_has_entity_name = True
-    _attr_name = "Weight"
+    _attr_translation_key = "weight"
     _attr_native_unit_of_measurement = UnitOfMass.GRAMS
     _attr_device_class = SensorDeviceClass.WEIGHT
     _attr_state_class = SensorStateClass.MEASUREMENT
@@ -96,7 +96,7 @@ class CurrentTemperatureSensor(SensorEntity):
     """Representation of a Current Temperature sensor."""
     
     _attr_has_entity_name = True
-    _attr_name = "Current Temperature"
+    _attr_translation_key = "current_temperature"
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
     _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_state_class = SensorStateClass.MEASUREMENT
@@ -134,7 +134,7 @@ class DeviceHardwareSensor(SensorEntity):
     """Representation of a Device Hardware sensor."""
     
     _attr_has_entity_name = True
-    _attr_name = "Device Hardware"
+    _attr_translation_key = "device_hardware"
     _attr_icon = "mdi:chip"
     
     def __init__(self, coordinator: PolarisDataUpdateCoordinator, entry_id: str) -> None:

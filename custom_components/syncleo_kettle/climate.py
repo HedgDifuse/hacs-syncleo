@@ -65,6 +65,8 @@ class SyncleoConditionerClimate(ClimateEntity):
 
     _attr_has_entity_name = True
     _attr_name = None
+    # Enables the translations/icons for the custom "silent"/"turbo" fan modes.
+    _attr_translation_key = "conditioner"
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _enable_turn_on_off_backwards_compatibility = False
 

@@ -30,6 +30,8 @@ Interactive commands:
     silent on|off
     eco on|off
     ion on|off
+    fungus on|off           fungal-infection prevention (program 0, byte 4)
+    clean on|off            self-cleaning (program 1, byte 1)
     state                   print last-known state
     quit
 """
@@ -43,7 +45,8 @@ from ipaddress import ip_address, IPv4Address
 
 # --- load the integration's protocol.py without importing the HA package ---
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_PROTO_PATH = os.path.join(_HERE, "custom_components", "syncleo_kettle", "protocol.py")
+_REPO_ROOT = os.path.dirname(_HERE)
+_PROTO_PATH = os.path.join(_REPO_ROOT, "custom_components", "syncleo_kettle", "protocol.py")
 _spec = importlib.util.spec_from_file_location("syncleo_protocol", _PROTO_PATH)
 proto = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(proto)
@@ -126,9 +129,38 @@ class Printer(proto.IncomingMessageListener):
         elif isinstance(message, proto.FanSpeedMessage):
             self.state["fan"] = message.speed
         elif isinstance(message, proto.ProgramDataMessage):
-            self.state["program_data"] = message.program_data.hex()
+            data = message.program_data
+            self.state["program_data"] = data.hex()
+            # Track both program arrays so outgoing commands can preserve
+            # the bits they don't change.
+            # program 0: [0, vertical, horizontal, eco, fungus_prevention]
+            # program 1: [1, self_clean, silent]
+            if data and data[0] == 0:
+                self.state["program0"] = list(data)
+            elif data and data[0] == 1:
+                self.state["program1"] = list(data)
         print(f"  << {cls}: {message}")
         return None  # let the connection ACK it
+
+
+def program0(listener) -> list:
+    """Last-seen program-0 array [0, vertical, horizontal, eco, fungus], padded to 5."""
+    p0 = list(listener.state.get("program0") or [])
+    if not p0 or p0[0] != 0:
+        p0 = [0, 0, 0, 0, 0]
+    while len(p0) < 5:
+        p0.append(0)
+    return p0
+
+
+def program1(listener) -> list:
+    """Last-seen program-1 array [1, self_clean, silent], padded to 3."""
+    p1 = list(listener.state.get("program1") or [])
+    if not p1 or p1[0] != 1:
+        p1 = [1, 0, 0]
+    while len(p1) < 3:
+        p1.append(0)
+    return p1
 
 
 def main():
@@ -209,18 +241,33 @@ def main():
                     time.sleep(2.5)
             elif cmd == "swing" and len(parts) == 2 and parts[1] in SWING:
                 v, h = SWING[parts[1]]
-                # program 0: [prefix=0, vertical, horizontal, eco, 0]
-                send(proto.ProgramDataMessage(bytes([0, v, h, 0, 0])))
+                p0 = program0(listener)
+                p0[1], p0[2] = v, h
+                send(proto.ProgramDataMessage(bytes(p0)))
             elif cmd == "turbo" and len(parts) == 2:
                 send(proto.TurboMessage(parts[1] in ("on", "1", "true")))
             elif cmd == "ion" and len(parts) == 2:
                 send(proto.IonizationMessage(parts[1] in ("on", "1", "true")))
             elif cmd == "silent" and len(parts) == 2:
                 on = parts[1] in ("on", "1", "true")
-                send(proto.ProgramDataMessage(bytes([1, 0, 1 if on else 0])))
+                p1 = program1(listener)
+                p1[2] = 1 if on else 0
+                send(proto.ProgramDataMessage(bytes(p1)))
+            elif cmd == "clean" and len(parts) == 2:
+                on = parts[1] in ("on", "1", "true")
+                p1 = program1(listener)
+                p1[1] = 1 if on else 0
+                send(proto.ProgramDataMessage(bytes(p1)))
             elif cmd == "eco" and len(parts) == 2:
                 on = parts[1] in ("on", "1", "true")
-                send(proto.ProgramDataMessage(bytes([0, 0, 0, 1 if on else 0, 0])))
+                p0 = program0(listener)
+                p0[3] = 1 if on else 0
+                send(proto.ProgramDataMessage(bytes(p0)))
+            elif cmd == "fungus" and len(parts) == 2:
+                on = parts[1] in ("on", "1", "true")
+                p0 = program0(listener)
+                p0[4] = 1 if on else 0
+                send(proto.ProgramDataMessage(bytes(p0)))
             else:
                 print("  ? unknown command. type 'help'")
             time.sleep(0.2)

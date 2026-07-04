@@ -21,15 +21,57 @@
     }
   },
   "entity": {
+    "climate": {
+      "conditioner": {
+        "state_attributes": {
+          "fan_mode": {
+            "state": {
+              "silent": "Silent",
+              "auto": "Auto",
+              "low": "Low",
+              "medium": "Medium",
+              "high": "High",
+              "turbo": "Turbo"
+            }
+          }
+        }
+      }
+    },
     "switch": {
       "child_lock": {
-        "name": "Child--Lock"
+        "name": "Child Lock"
       },
       "volume": {
         "name": "Volume"
       },
       "backlight": {
         "name": "Backlight"
+      },
+      "eco": {
+        "name": "Eco"
+      },
+      "ionization": {
+        "name": "Ionization"
+      },
+      "display": {
+        "name": "Display"
+      },
+      "fungus_prevention": {
+        "name": "Fungus Prevention"
+      },
+      "self_clean": {
+        "name": "Self-Cleaning"
+      }
+    },
+    "sensor": {
+      "current_temperature": {
+        "name": "Current Temperature"
+      },
+      "weight": {
+        "name": "Weight"
+      },
+      "device_hardware": {
+        "name": "Device Hardware"
       }
     },
     "water_heater": {
